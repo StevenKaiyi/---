@@ -61,9 +61,11 @@ def load_stopwords(filename='中文停用词表.txt'):
 
 # 提取网页中的文本内容
 def extract_text(html_doc):
-    soup = BeautifulSoup(html_doc, 'html.parser')
-    text = soup.get_text()
-    return text
+    soup = BeautifulSoup(html_doc, 'lxml') 
+    raw_text = soup.get_text()
+    text_with_space = raw_text.replace('\t', ' ').replace('\n', ' ')
+    clean_text= re.sub(r'\s+', ' ', text_with_space)
+    return clean_text
 
 # 爬取链接
 def crawl_all_urls(html_doc, url):
@@ -327,4 +329,5 @@ def main():
     main_crawl()
     #search()
     print(get_document_via_id(3000,documents))
+
 main()
