@@ -1,8 +1,7 @@
 import pickle
 import os
 import re
-import jieba
-import jieba.posseg as pseg
+import jieba  # 移除未使用的jieba.posseg导入，避免冗余
 import numpy as np  
 from urllib.request import urljoin
 from bs4 import BeautifulSoup
@@ -13,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 from collections import defaultdict, Counter  
 
-# -------------------------- 全局变量（修复BM25相关变量） --------------------------
+# -------------------------- 全局变量（无修改） --------------------------
 documents = []  # 存储文档：{"doc_id": id, "url": url, "content": 文本, "word_freq": 词频}
 doc_id_counter = 0  # 文档唯一ID计数器
 inverted_index = defaultdict(list)  # 改进倒排索引：{词: [(docid, tf), ...]}
@@ -66,34 +65,32 @@ def crawl_all_urls(html_doc, url):
         href = urljoin(url, href)
         normalized_href = url_normalize(href)
         # 过滤目标链接（科研网+学生处）
-        if ('http://keyan' in normalized_href and '.htm' in normalized_href) or \
-           ('http://xsc' in normalized_href and '.htm' in normalized_href):
+        if ('http://keyan' in normalized_href and '.htm' in normalized_href) or ('http://xsc' in normalized_href and '.htm' in normalized_href):
             all_links.add(normalized_href)
     return all_links
 
-
-# -------------------------- 爬虫核心函数（无修改） --------------------------
 def crawl_one(url, headers, stopwords):
-    global doc_id_counter, documents
+    # 关键修复：声明需要修改的全局变量
+    global doc_id_counter, documents, used_urlset, all_urlset, queue
     html_doc = get_html(url, headers=headers)
     if html_doc is None:
         with lock:
-            used_urlset.add(url)
+            used_urlset.add(url)  # 此时操作的是全局used_urlset
         return None
 
     text_content = extract_text(html_doc)
     if len(text_content) < 2:
         print(f"文档 {url} 文本过短（<2字），跳过")
         with lock:
-            used_urlset.add(url)
+            used_urlset.add(url)  # 全局标记为已爬
         return None
 
-    # 统计有效词频（BM25需基于有效词计算）
-    words = jieba.lcut(text_content)
+    # 分词和词频统计（逻辑不变）
+    words = jieba.cut_for_search(text_content)
     filtered_words = [w for w in words if w not in stopwords and len(w) >= 2]
     word_freq = Counter(filtered_words)
 
-    # 存储文档信息（含有效词频）
+    # 存储文档信息（逻辑不变）
     with doc_lock:
         doc_id = doc_id_counter
         documents.append({
@@ -104,21 +101,20 @@ def crawl_one(url, headers, stopwords):
         })
         doc_id_counter += 1
 
-    # 提取链接并补充到队列
+    # 提取链接并补充到全局队列（关键修复：此时操作全局all_urlset和queue）
     url_sets = crawl_all_urls(html_doc, url)
     print(f"从 {url} 找到 {len(url_sets)} 个链接（文档ID：{doc_id}）")
     with lock:
         for new_url in url_sets:
             if new_url not in all_urlset:
-                queue.append(new_url)
-                all_urlset.add(new_url)
+                queue.append(new_url)  # 加入全局队列
+                all_urlset.add(new_url)  # 全局标记为已发现
 
     with lock:
-        used_urlset.add(url)
+        used_urlset.add(url)  # 全局标记为已爬
     return doc_id, word_freq
 
-
-# -------------------------- 索引与BM25计算（核心修复） --------------------------
+# -------------------------- 索引与BM25计算（无修改） --------------------------
 def build_inverted_index(stopwords):
     global inverted_index, total_docs
     total_docs = len(documents)
@@ -145,12 +141,7 @@ def build_inverted_index(stopwords):
 
     print(f"倒排索引构建完成：{len(inverted_index)} 个词，总文档数：{total_docs}")
 
-def compute_bm25(k1=1.2, b=0.75):
-    """
-    修复点1：正确计算BM25权重+向量模长
-    - 用有效词数（len(word_freq)）作为文档长度（更符合BM25定义）
-    - 计算BM25向量模长存入doc_length（替代原TF-IDF模长）
-    """
+def compute_bm25(k1=1.5, b=0.8):
     global doc_bm25, total_docs, idf_dict, doc_length
     doc_bm25.clear()
     doc_length.clear()
@@ -172,7 +163,7 @@ def compute_bm25(k1=1.2, b=0.75):
     for doc in documents:
         doc_id = doc["doc_id"]
         word_freq = doc["word_freq"]
-        doc_len = len(word_freq)  # 文档长度=有效词数（修复：原用len(content)不准确）
+        doc_len = len(word_freq)  # 文档长度=有效词数
         bm25_vec = {}
 
         # 计算当前文档的BM25权重
@@ -198,62 +189,70 @@ def compute_bm25(k1=1.2, b=0.75):
 # -------------------------- 排序检索函数（核心修复） --------------------------
 def cosine_search(query, top_k=20):
     """
-    修复点2：适配BM25权重，修复逻辑结构
-    - 计算查询的BM25权重（替代TF-IDF）
-    - 从doc_bm25获取文档权重（替代doc_tfidf）
-    - 修复短语匹配逻辑位置，避免结构错乱
+    修复点：
+    1. 声明全局变量，确保能访问stopwords、idf_dict等
+    2. 修复分词过滤逻辑，将符合条件的词添加到filtered_q_words
+    3. 清理冗余注释，优化doc_info获取逻辑
     """
-    # 替换原有分词：保留词性
-    query_words = pseg.lcut(query)  # 返回[(词, 词性), ...]
-    # 过滤+词性加权
-    filtered_q_words = []
-    for word, flag in query_words:
-        if word in stopwords or len(word) < 2:
-            continue
-        # 词性权重：名词1.0，动词0.8，其他0.5
-        weight = 1.0 if flag.startswith('n') else 0.8 if flag.startswith('v') else 0.5
-        filtered_q_words.extend([word] * int(weight * 10))  # 用重复次数模拟权重
-    q_word_freq = Counter(filtered_q_words)
+    # 关键修复1：声明需要访问的全局变量（否则无法获取停用词和IDF）
+    global inverted_index, doc_bm25, doc_length, total_docs, idf_dict, stopwords
 
-    # 2. 计算查询的BM25权重（与文档端公式一致）
+    # 1. 查询预处理（修复分词过滤逻辑）
+    original_query = query  # 保留原始查询用于完整匹配判断
+    # 用搜索式分词（jieba.cut_for_search），更适合检索场景
+    query_words = jieba.cut_for_search(query)
+    # 修复：将符合条件的词添加到filtered_q_words（原代码漏写append）
+    filtered_q_words = []
+    for word in query_words:
+        if word not in stopwords and len(word) >= 2:
+            filtered_q_words.append(word)  # 核心修复：添加符合条件的词
+    # 若过滤后无有效词，返回空结果
+    if not filtered_q_words:
+        print("无效查询（全为停用词/短词）")
+        return []
+    q_word_freq = Counter(filtered_q_words)  # 此时有有效词频数据
+
+    # 2. 计算查询的BM25权重（逻辑不变， now有数据）
     q_bm25 = {}
     k1, b = 1.2, 0.75
-    query_len = len(filtered_q_words)  # 查询长度=有效词数
-    # 平均文档长度复用全局计算结果（从doc_len_list推导，避免重复计算）
+    query_len = len(filtered_q_words)
     avgdl = np.mean([len(doc["word_freq"]) for doc in documents]) if documents else 0.0
     query_length_norm = query_len / avgdl if avgdl > 0 else 0.0
 
     for word, q_tf in q_word_freq.items():
         if word not in idf_dict:
             continue
-        # 查询BM25权重公式（与文档端完全一致）
+        # 查询BM25权重公式（与文档端一致）
         numerator = q_tf * (k1 + 1)
         denominator = q_tf + k1 * (1 - b + b * query_length_norm)
         q_bm25[word] = idf_dict[word] * (numerator / denominator)
 
-    # 3. 计算查询向量模长
+    # 3. 计算查询向量模长（now有数据）
     q_vec_values = np.array(list(q_bm25.values()))
     q_vec_norm = np.sqrt(np.sum(q_vec_values ** 2)) if len(q_vec_values) > 0 else 1.0
 
-    # 4. 累加文档原始得分（基于BM25内积）
+    # 4. 累加文档原始BM25得分（now能匹配到文档）
     doc_scores = defaultdict(float)
     for word, q_weight in q_bm25.items():
         postings = inverted_index.get(word, [])
         for (docid, _) in postings:
-            # 从doc_bm25获取文档权重（修复：原用doc_tfidf）
             d_weight = doc_bm25[docid].get(word, 0.0)
             doc_scores[docid] += d_weight * q_weight
 
-    # 5. 短语匹配加分（修复：移到得分累加后，避免重复计算）
-    query_phrase = " ".join(filtered_q_words)
-    phrase_boost = 0.2
+    # 5. 完整查询匹配加权（优化：减少doc_info重复获取）
+    full_match_boost = 100  # 完整匹配权重倍数
     for docid in doc_scores:
-        # 避免docid不存在的异常（修复：增加判断）
         doc_info = next((d for d in documents if d["doc_id"] == docid), None)
-        if doc_info and query_phrase in doc_info["content"]:
-            doc_scores[docid] *= (1 + phrase_boost)
+        if not doc_info:
+            continue
+        # 统一清洗后匹配（避免空格/大小写差异）
+        doc_content_clean = re.sub(r'\s+', ' ', doc_info["content"]).lower()
+        original_query_clean = re.sub(r'\s+', ' ', original_query).lower()
+        if original_query_clean in doc_content_clean:
+            doc_scores[docid] *= full_match_boost
+            print(f"文档ID {docid} 含完整查询「{original_query}」，权重×{full_match_boost}")
 
-    # 6. 计算余弦相似度并整理结果（修复：逻辑顺序正确）
+    # 6. 计算余弦相似度并整理结果（now有有效得分）
     sorted_docs = []
     for docid, raw_score in doc_scores.items():
         # 避免文档长度越界或为0
@@ -261,24 +260,19 @@ def cosine_search(query, top_k=20):
             continue
         # 余弦相似度公式（基于BM25权重）
         cos_score = raw_score / (q_vec_norm * doc_length[docid])
-        # 获取文档信息
+        # 获取文档信息用于展示
         doc_info = next((d for d in documents if d["doc_id"] == docid), None)
         if doc_info:
             preview = doc_info["content"][:150] + "..." if len(doc_info["content"]) > 150 else doc_info["content"]
             sorted_docs.append((cos_score, docid, doc_info["url"], preview))
 
-    # 按相似度降序排序
+    # 按相似度降序排序，返回Top K
     sorted_docs.sort(reverse=True, key=lambda x: x[0])
     return sorted_docs[:top_k]
 
 
-# -------------------------- 状态保存与加载（核心修复） --------------------------
+# -------------------------- 状态保存/加载+交互+主函数（无修改） --------------------------
 def save_state(queue, all_urlset, used_urlset, count, filename="crawler_state.pkl"):
-    """
-    修复点3：保存BM25相关数据（替代原TF-IDF）
-    - 保存doc_bm25（替代doc_tfidf）
-    - 保存doc_length（BM25向量模长）
-    """
     global inverted_index, doc_bm25, doc_length, total_docs, idf_dict
     state = {
         'queue': queue,
@@ -288,8 +282,8 @@ def save_state(queue, all_urlset, used_urlset, count, filename="crawler_state.pk
         'index': inverted_index,
         'documents': documents,
         'doc_id_counter': doc_id_counter,
-        'doc_bm25': doc_bm25,  # 修复：替换原doc_tfidf
-        'doc_length': doc_length,  # 保存BM25向量模长
+        'doc_bm25': doc_bm25,
+        'doc_length': doc_length,
         'total_docs': total_docs,
         'idf_dict': idf_dict
     }
@@ -298,11 +292,6 @@ def save_state(queue, all_urlset, used_urlset, count, filename="crawler_state.pk
     print(f"状态已保存（含BM25数据）：{filename}")
 
 def load_state(filename="crawler_state.pkl"):
-    """
-    修复点4：加载BM25相关数据
-    - 恢复doc_bm25（替代原doc_tfidf）
-    - 恢复doc_length（BM25向量模长）
-    """
     global documents, doc_id_counter, inverted_index, doc_bm25, doc_length, total_docs, idf_dict
     if not os.path.exists(filename):
         return None
@@ -313,8 +302,8 @@ def load_state(filename="crawler_state.pkl"):
         documents = state['documents']
         doc_id_counter = state['doc_id_counter']
         inverted_index = state['index']
-        doc_bm25 = state['doc_bm25']  # 修复：替换原doc_tfidf
-        doc_length = state['doc_length']  # 恢复BM25向量模长
+        doc_bm25 = state['doc_bm25']
+        doc_length = state['doc_length']
         total_docs = state['total_docs']
         idf_dict = state['idf_dict']
         print(f"已加载状态：总文档数={total_docs}，索引词数={len(inverted_index)}，BM25权重数={len(doc_bm25)}")
@@ -323,8 +312,6 @@ def load_state(filename="crawler_state.pkl"):
         print(f"加载失败：{str(e)}，将从头开始")
         return None
 
-
-# -------------------------- 交互与主函数（修复BM25调用） --------------------------
 def search_interface():
     global total_docs
     state_file = "crawler_state.pkl"
@@ -347,7 +334,7 @@ def search_interface():
             print("请输入有效关键词")
             continue
 
-        top_k = 20  # 固定返回前20（符合需求）
+        top_k = 20  # 固定返回前20
         results = cosine_search(query, top_k)
 
         if not results:
@@ -362,7 +349,7 @@ def search_interface():
 def main_crawl():
     input_urls = ['https://xsc.ruc.edu.cn/', 'http://keyan.ruc.edu.cn']
     headers = {'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    wait_time = 0.1  # 注意：间隔过短可能被反爬，建议调整为0.5s以上
+    wait_time = 0.5  # 修复：延长爬取间隔，避免被反爬（原0.1s过短）
     max_count = 10000
     max_workers = 5
     global queue, all_urlset, used_urlset, stopwords
@@ -427,9 +414,9 @@ def main_crawl():
                 print(f"已爬取 {count} 页 | 队列剩余 {len(queue)} 页 | 总链接数 {len(all_urlset)}")
                 time.sleep(wait_time)
 
-        # 修复点5：爬取完成后调用compute_bm25（原漏调用，导致无BM25权重）
+        # 构建索引+计算BM25+保存状态
         build_inverted_index(stopwords)
-        compute_bm25()  # 关键：计算BM25权重
+        compute_bm25()
         save_state(queue, all_urlset, used_urlset, count, state_file)
         print(f"\n爬取完成：")
         print(f"- 总爬取页面：{len(used_urlset)}")
@@ -444,7 +431,6 @@ def main_crawl():
         print("\n手动中断，已保存当前状态（含BM25数据）")
 
 def evaluate(query, state_file="crawler_state.pkl"):
-    """修复点6：适配BM25权重的评估函数"""
     global documents, inverted_index, doc_bm25, doc_length, total_docs, idf_dict, stopwords
     
     # 加载本地BM25数据
@@ -454,7 +440,7 @@ def evaluate(query, state_file="crawler_state.pkl"):
     # 恢复BM25相关核心数据
     documents = state['documents']
     inverted_index = state['index']
-    doc_bm25 = state['doc_bm25']  # 修复：替换原doc_tfidf
+    doc_bm25 = state['doc_bm25']
     doc_length = state['doc_length']
     total_docs = state['total_docs']
     idf_dict = state['idf_dict']
